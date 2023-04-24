@@ -118,6 +118,40 @@ func (d *DNSProvider) Timeout() (timeout, interval time.Duration) {
 	return d.config.PropagationTimeout, d.config.PollingInterval
 }
 
+func (d *DNSProvider) CreateRecord(fqdn, value string) error {
+	authZone, err := dns01.FindZoneByFqdn(fqdn)
+	if err != nil {
+		return fmt.Errorf("cloudflare: %v", err)
+	}
+
+	zoneID, err := d.client.ZoneIDByName(authZone)
+	if err != nil {
+		return fmt.Errorf("cloudflare: failed to find zone %s: %v", authZone, err)
+	}
+
+	dnsRecord := cloudflare.DNSRecord{
+		Type:    "TXT",
+		Name:    dns01.UnFqdn(fqdn),
+		Content: value,
+		TTL:     d.config.TTL,
+	}
+
+	response, err := d.client.CreateDNSRecord(zoneID, dnsRecord)
+	if err != nil {
+		return fmt.Errorf("cloudflare: failed to create TXT record: %v", err)
+	}
+
+	if !response.Success {
+		return fmt.Errorf("cloudflare: failed to create TXT record: %+v %+v", response.Errors, response.Messages)
+	}
+
+	d.recordIDsMu.Lock()
+	d.recordIDs[fqdn] = response.Result.ID
+	d.recordIDsMu.Unlock()
+
+	return nil
+}
+
 // Present creates a TXT record to fulfill the dns-01 challenge
 func (d *DNSProvider) Present(domain, token, keyAuth string) error {
 	fqdn, value := dns01.GetRecord(domain, keyAuth)
@@ -153,6 +187,38 @@ func (d *DNSProvider) Present(domain, token, keyAuth string) error {
 	d.recordIDsMu.Unlock()
 
 	log.Infof("cloudflare: new record for %s, ID %s", domain, response.Result.ID)
+
+	return nil
+}
+
+func (d *DNSProvider) RemoveRecord(fqdn, value string) error {
+	authZone, err := dns01.FindZoneByFqdn(fqdn)
+	if err != nil {
+		return fmt.Errorf("cloudflare: %v", err)
+	}
+
+	zoneID, err := d.client.ZoneIDByName(authZone)
+	if err != nil {
+		return fmt.Errorf("cloudflare: failed to find zone %s: %v", authZone, err)
+	}
+
+	// get the record's unique ID from when we created it
+	d.recordIDsMu.Lock()
+	recordID, ok := d.recordIDs[fqdn]
+	d.recordIDsMu.Unlock()
+	if !ok {
+		return fmt.Errorf("cloudflare: unknown record ID for '%s'", fqdn)
+	}
+
+	err = d.client.DeleteDNSRecord(zoneID, recordID)
+	if err != nil {
+		log.Printf("cloudflare: failed to delete TXT record: %v", err)
+	}
+
+	// Delete record ID from map
+	d.recordIDsMu.Lock()
+	delete(d.recordIDs, fqdn)
+	d.recordIDsMu.Unlock()
 
 	return nil
 }
